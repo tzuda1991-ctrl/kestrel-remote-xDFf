@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import uvicorn
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -63,6 +63,13 @@ def initialize_db():
             payload TEXT NOT NULL,
             created_at TEXT NOT NULL,
             completed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS share_requests (
+            code TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            expires REAL NOT NULL,
+            sender INTEGER UNIQUE
         );
         CREATE INDEX IF NOT EXISTS idx_commands_pending
             ON commands(device_id, completed_at, id);
@@ -370,6 +377,84 @@ async def cmd_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Visible notification queued.")
 
 
+SHARE_TYPES = {"camera": "photo", "file": "document", "location": "location"}
+
+
+async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not require_admin(update):
+        return
+    msg = update.effective_message
+    kind = msg.text.split()[0][1:].split("@")[0].lower()
+    with connect_db() as conn:
+        rows = conn.execute("SELECT device_id, name FROM devices").fetchall()
+        device = next((r for r in rows if context.args == [r["device_id"]]), None)
+        if not context.args and len(rows) == 1:
+            device = rows[0]
+        if device:
+            code = secrets.token_hex(6)
+            now = time.time()
+            conn.execute("DELETE FROM share_requests WHERE expires<=?", (now,))
+            conn.execute("INSERT INTO share_requests(code,device_id,kind,expires) VALUES(?,?,?,?)",
+                         (code, device["device_id"], kind, now + 600))
+            notice = (f"Request for one {SHARE_TYPES[kind]}. To share with the Kestrel admin, "
+                      f"open @{context.bot.username} on Telegram and send /start {code} within 10 minutes. "
+                      "You can ignore this request.")
+            conn.execute("INSERT INTO commands(device_id,command,payload,created_at) VALUES(?,'notify',?,?)",
+                         (device["device_id"], notice, utc_now()))
+    if device:
+        await msg.reply_text(f"Sharing request queued for {device['name']}. Waiting for the phone owner.")
+    else:
+        await msg.reply_text(f"Use /devices and send /{kind} DEVICE_ID.")
+
+
+async def accept_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    msg = update.effective_message
+    if len(context.args) != 1:
+        await msg.reply_text("For a sharing request, send the /start code shown on your phone.")
+        return
+    sender = update.effective_user.id
+    with connect_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        req = conn.execute("SELECT * FROM share_requests WHERE code=? AND expires>? AND (sender IS NULL OR sender=?)",
+                           (context.args[0], time.time(), sender)).fetchone()
+        if req:
+            conn.execute("UPDATE share_requests SET sender=NULL WHERE sender=?", (sender,))
+            conn.execute("UPDATE share_requests SET sender=? WHERE code=?", (sender, req["code"]))
+    if req:
+        prompt = {"camera": "Take a photo using the attachment camera and send it",
+                  "file": "Choose File in the attachment menu and send one document",
+                  "location": "Choose Location and send your current location once"}[req["kind"]]
+        await msg.reply_text(f"{prompt} here to share it with the Kestrel admin. To skip, send nothing.")
+    else:
+        await msg.reply_text("Request expired or unavailable.")
+
+
+async def receive_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if update.effective_chat.type != "private":
+        return
+    with connect_db() as conn:
+        req = conn.execute("SELECT * FROM share_requests WHERE sender=? AND expires>?",
+                           (update.effective_user.id, time.time())).fetchone()
+    if not req:
+        return
+    kind = req["kind"]
+    if not getattr(msg, SHARE_TYPES[kind]) or (msg.location and msg.location.live_period):
+        await msg.reply_text(f"Please send one {SHARE_TYPES[kind]} for this request.")
+        return
+    try:
+        if update.effective_chat.id != ADMIN_ID:
+            await msg.copy(chat_id=ADMIN_ID)
+    except Exception:
+        await msg.reply_text("Delivery failed. You can retry before the request expires.")
+        return
+    with connect_db() as conn:
+        conn.execute("DELETE FROM share_requests WHERE code=?", (req["code"],))
+    await msg.reply_text("Shared in the Kestrel admin chat.")
+
+
 async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not require_admin(update):
         return
@@ -395,6 +480,9 @@ async def start_bot(token: str, admin_id: int):
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("notify", cmd_notify))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
+    app.add_handler(CommandHandler(list(SHARE_TYPES), cmd_share))
+    app.add_handler(CommandHandler("start", accept_share))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.LOCATION, receive_share))
     await app.initialize()
     try:
         await app.start()
